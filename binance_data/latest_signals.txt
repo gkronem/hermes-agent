@@ -1,0 +1,5 @@
+Buscando top 15 pares USDT por volume...
+
+[ERRO] Não foi possível conectar à Binance: 451 Client Error:  for url: https://fapi.binance.com/fapi/v1/ticker/24hr
+Dica: execute com --demo para ver um exemplo da análise.
+
