@@ -32,10 +32,25 @@ jobs:
       - name: Create output directory
         run: mkdir -p binance_data
 
-      # v2 - usa deteccao automatica de exchange (Binance -> Bybit -> OKX)
+      # || true garante que o step nao falha mesmo quando exchanges sao bloqueadas
       - name: Run signal scanner (auto-detect exchange)
         run: |
-          python binance_futures_signals.py --top 20 --interval 1h 2>&1 | tee binance_data/latest_signals.txt
+          set +e
+          python binance_futures_signals.py --top 20 --interval 1h > binance_data/latest_signals.txt 2>&1
+          echo "exit_code=$?" >> binance_data/latest_signals.txt
+
+      - name: Test exchange connectivity
+        run: |
+          {
+            echo "=== Connectivity test ==="
+            for url in \
+              "https://fapi.binance.com/fapi/v1/ping" \
+              "https://api.bybit.com/v5/market/time" \
+              "https://www.okx.com/api/v5/public/time"; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || echo "000")
+              echo "$code  $url"
+            done
+          } >> binance_data/latest_signals.txt
 
       - name: Save timestamp
         run: echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" > binance_data/last_updated.txt
