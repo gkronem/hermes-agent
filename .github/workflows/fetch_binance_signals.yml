@@ -1,0 +1,49 @@
+name: Binance Futures Signal Scanner
+
+on:
+  push:
+    branches:
+      - "claude/binance-futures-signals-9uNJD"
+    paths-ignore:
+      - "binance_data/**"
+      - "*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Create output directory
+        run: mkdir -p binance_data
+
+      - name: Run Binance signal scanner
+        run: python binance_futures_signals.py --top 20 --interval 1h 2>&1 | tee binance_data/latest_signals.txt
+
+      - name: Save timestamp
+        run: echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" > binance_data/last_updated.txt
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin claude/binance-futures-signals-9uNJD
+          git add binance_data/
+          git diff --staged --quiet && echo "Sem mudancas" || {
+            git commit -m "data: update Binance futures signals [skip ci]"
+            git push
+          }
