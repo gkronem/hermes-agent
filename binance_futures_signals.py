@@ -1,22 +1,27 @@
 """
-Futures Signal Scanner — Binance / Bybit / OKX
-Analisa pares USDT perpétuos e identifica oportunidades de long/short
-usando RSI, EMA, MACD e funding rate (apenas APIs públicas, sem autenticação).
+Multi-timeframe futures structure scanner for USDT perpetuals.
 
-Uso:
-    python binance_futures_signals.py                    # detecta exchange automaticamente
-    python binance_futures_signals.py --exchange bybit   # força exchange
-    python binance_futures_signals.py --demo             # modo demonstração (sem internet)
-    python binance_futures_signals.py --top 20 --interval 4h
+Scans Binance / Bybit / OKX perpetual pairs and builds a directional read
+using EMA 9, SMA 20, and a lightweight Smart Money Concepts approximation:
+- break of structure (BOS)
+- bullish / bearish swing structure
+- premium / discount
+- simple liquidity sweep detection
+
+Usage:
+    python binance_futures_signals.py
+    python binance_futures_signals.py --exchange bybit
+    python binance_futures_signals.py --top 50
+    python binance_futures_signals.py --symbols BTCUSDT,SOLUSDT
+    python binance_futures_signals.py --demo
 """
 
 import sys
 import time
-import math
 import random
 import argparse
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     import requests
@@ -24,468 +29,641 @@ try:
 except ImportError:
     _HAS_REQUESTS = False
 
-# Configurações (sobrescritas pelos args)
-TOP_N       = 15
-KLINE_LIMIT = 100
-INTERVAL    = "1h"
-EXCHANGE    = "auto"   # auto | binance | bybit | okx
+EXCHANGE = "auto"
+TOP_N = 0
+KLINE_LIMIT = 250
+TIMEFRAMES = ("4h", "1h", "15m", "1m")
+EMA_LENGTH = 9
+SMA_LENGTH = 20
+SWING_LOOKBACK = 2
 
-RSI_OVERSOLD   = 35
-RSI_OVERBOUGHT = 65
-EMA_FAST       = 9
-EMA_SLOW       = 21
-
-# Endpoints base
 ENDPOINTS = {
     "binance": "https://fapi.binance.com/fapi/v1",
-    "bybit":   "https://api.bybit.com/v5",
-    "okx":     "https://www.okx.com/api/v5",
+    "bybit": "https://api.bybit.com/v5",
+    "okx": "https://www.okx.com/api/v5",
 }
 
 
-# ── Estrutura de dados ───────────────────────────────────────────────────────
-
 @dataclass
-class Signal:
+class MarketMeta:
     symbol: str
     price: float
     change_24h: float
     volume_usdt: float
-    rsi: Optional[float]
-    ema_fast: Optional[float]
-    ema_slow: Optional[float]
-    macd: Optional[float]
-    macd_signal: Optional[float]
-    funding_rate: Optional[float]
-    score: float = 0.0
-    direction: str = "NEUTRO"
-    reasons: list = field(default_factory=list)
+    venue_id: str
 
 
-# ── Indicadores técnicos (puro Python, sem numpy) ───────────────────────────
+@dataclass
+class TimeframeSignal:
+    timeframe: str
+    price: float
+    ema9: float
+    sma20: float
+    ma_stack: str
+    price_vs_ma: str
+    ema_slope: str
+    structure: str
+    swing_high: float
+    swing_low: float
+    pd_location: str
+    liquidity: str
+    score: float
+    reasons: List[str] = field(default_factory=list)
 
-def _ema(closes: list, period: int) -> list:
+
+@dataclass
+class CoinSignal:
+    symbol: str
+    price: float
+    change_24h: float
+    volume_usdt: float
+    funding_rate: float
+    direction: str
+    score: float
+    bias: str
+    timeframe_signals: Dict[str, TimeframeSignal]
+    reasons: List[str] = field(default_factory=list)
+
+
+def _ema_series(values: List[float], period: int) -> List[float]:
     k = 2 / (period + 1)
-    result = [closes[0]]
-    for c in closes[1:]:
-        result.append(c * k + result[-1] * (1 - k))
-    return result
+    ema = [values[0]]
+    for value in values[1:]:
+        ema.append(value * k + ema[-1] * (1 - k))
+    return ema
 
 
-def calc_rsi(closes: list, period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return float("nan")
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    return 100 - (100 / (1 + avg_gain / avg_loss))
+def _sma(values: List[float], period: int) -> float:
+    return sum(values[-period:]) / period
 
-
-def calc_macd(closes: list) -> tuple:
-    if len(closes) < 35:
-        return float("nan"), float("nan")
-    ema12 = _ema(closes, 12)
-    ema26 = _ema(closes, 26)
-    macd_line = [m - s for m, s in zip(ema12, ema26)]
-    signal_line = _ema(macd_line, 9)
-    return macd_line[-1], signal_line[-1]
-
-
-# ── Conversão de intervalo entre exchanges ───────────────────────────────────
 
 def _to_bybit_interval(iv: str) -> str:
     mapping = {
-        "1m": "1",  "3m": "3",  "5m": "5", "15m": "15", "30m": "30",
+        "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
         "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
-        "1d": "D",  "1w": "W",  "1M": "M",
+        "1d": "D", "1w": "W", "1M": "M",
     }
     return mapping.get(iv.lower(), "60")
 
 
 def _to_okx_interval(iv: str) -> str:
     mapping = {
-        "1m": "1m",  "3m": "3m",  "5m": "5m", "15m": "15m", "30m": "30m",
-        "1h": "1H",  "2h": "2H",  "4h": "4H", "6h": "6H",  "12h": "12H",
-        "1d": "1D",  "1w": "1W",
+        "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H",
+        "1d": "1D", "1w": "1W",
     }
     return mapping.get(iv.lower(), "1H")
 
 
-# ── Adaptador Binance ────────────────────────────────────────────────────────
+def _swing_points(highs: List[float], lows: List[float], lookback: int = SWING_LOOKBACK) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    swing_highs: List[Tuple[int, float]] = []
+    swing_lows: List[Tuple[int, float]] = []
+    for i in range(lookback, len(highs) - lookback):
+        high = highs[i]
+        low = lows[i]
+        if all(high > highs[j] for j in range(i - lookback, i)) and all(high >= highs[j] for j in range(i + 1, i + 1 + lookback)):
+            swing_highs.append((i, high))
+        if all(low < lows[j] for j in range(i - lookback, i)) and all(low <= lows[j] for j in range(i + 1, i + 1 + lookback)):
+            swing_lows.append((i, low))
+    return swing_highs, swing_lows
+
+
+def _structure(closes: List[float], highs: List[float], lows: List[float]) -> Tuple[str, float, float, str]:
+    swing_highs, swing_lows = _swing_points(highs, lows)
+    recent_highs = swing_highs[-6:]
+    recent_lows = swing_lows[-6:]
+
+    last_swing_high = recent_highs[-1][1] if recent_highs else max(highs[-20:])
+    last_swing_low = recent_lows[-1][1] if recent_lows else min(lows[-20:])
+    close = closes[-1]
+
+    if close > last_swing_high:
+        state = "BOS up"
+    elif close < last_swing_low:
+        state = "BOS down"
+    else:
+        hh = len(recent_highs) >= 2 and recent_highs[-1][1] > recent_highs[-2][1]
+        hl = len(recent_lows) >= 2 and recent_lows[-1][1] > recent_lows[-2][1]
+        lh = len(recent_highs) >= 2 and recent_highs[-1][1] < recent_highs[-2][1]
+        ll = len(recent_lows) >= 2 and recent_lows[-1][1] < recent_lows[-2][1]
+        if hh and hl:
+            state = "bullish structure"
+        elif lh and ll:
+            state = "bearish structure"
+        else:
+            state = "range / transition"
+
+    liquidity = "none"
+    if len(recent_highs) >= 2 and highs[-1] > recent_highs[-1][1] and close < recent_highs[-1][1]:
+        liquidity = "buy-side sweep"
+    elif len(recent_lows) >= 2 and lows[-1] < recent_lows[-1][1] and close > recent_lows[-1][1]:
+        liquidity = "sell-side sweep"
+
+    return state, last_swing_high, last_swing_low, liquidity
+
+
+def _analyze_timeframe(timeframe: str, candles: List[Dict[str, float]]) -> TimeframeSignal:
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+
+    ema_series = _ema_series(closes, EMA_LENGTH)
+    ema9 = ema_series[-1]
+    prev_ema9 = ema_series[-2]
+    sma20 = _sma(closes, SMA_LENGTH)
+    price = closes[-1]
+
+    ma_stack = "bullish" if ema9 > sma20 else "bearish" if ema9 < sma20 else "flat"
+    if price > ema9 and price > sma20:
+        price_vs_ma = "above both"
+    elif price < ema9 and price < sma20:
+        price_vs_ma = "below both"
+    else:
+        price_vs_ma = "between MAs"
+
+    ema_slope = "up" if ema9 > prev_ema9 else "down"
+    structure, swing_high, swing_low, liquidity = _structure(closes, highs, lows)
+    midpoint = (swing_high + swing_low) / 2
+    pd_location = "premium" if price > midpoint else "discount"
+
+    score = 0.0
+    reasons: List[str] = []
+
+    if ma_stack == "bullish":
+        score += 1.0
+        reasons.append("EMA 9 above SMA 20")
+    elif ma_stack == "bearish":
+        score -= 1.0
+        reasons.append("EMA 9 below SMA 20")
+
+    if price_vs_ma == "above both":
+        score += 0.75
+        reasons.append("price above EMA 9 and SMA 20")
+    elif price_vs_ma == "below both":
+        score -= 0.75
+        reasons.append("price below EMA 9 and SMA 20")
+
+    if ema_slope == "up":
+        score += 0.5
+        reasons.append("EMA 9 slope rising")
+    else:
+        score -= 0.5
+        reasons.append("EMA 9 slope falling")
+
+    if structure == "BOS up":
+        score += 1.5
+        reasons.append("break of structure up")
+    elif structure == "BOS down":
+        score -= 1.5
+        reasons.append("break of structure down")
+    elif structure == "bullish structure":
+        score += 1.0
+        reasons.append("higher-high / higher-low sequence")
+    elif structure == "bearish structure":
+        score -= 1.0
+        reasons.append("lower-high / lower-low sequence")
+    else:
+        reasons.append("range or transition")
+
+    if liquidity == "sell-side sweep":
+        score += 0.5
+        reasons.append("sell-side liquidity sweep")
+    elif liquidity == "buy-side sweep":
+        score -= 0.5
+        reasons.append("buy-side liquidity sweep")
+
+    if pd_location == "discount":
+        reasons.append("trading in discount of active swing")
+    else:
+        reasons.append("trading in premium of active swing")
+
+    return TimeframeSignal(
+        timeframe=timeframe,
+        price=price,
+        ema9=ema9,
+        sma20=sma20,
+        ma_stack=ma_stack,
+        price_vs_ma=price_vs_ma,
+        ema_slope=ema_slope,
+        structure=structure,
+        swing_high=swing_high,
+        swing_low=swing_low,
+        pd_location=pd_location,
+        liquidity=liquidity,
+        score=score,
+        reasons=reasons,
+    )
+
+
+def _composite_bias(tf_signals: Dict[str, TimeframeSignal], funding_rate: float) -> Tuple[str, float, List[str]]:
+    weights = {"4h": 4.0, "1h": 3.0, "15m": 2.0, "1m": 1.0}
+    total = sum(tf_signals[tf].score * weights[tf] for tf in TIMEFRAMES)
+    reasons: List[str] = []
+
+    higher = [tf_signals["4h"], tf_signals["1h"]]
+    lower = [tf_signals["15m"], tf_signals["1m"]]
+
+    if all(tf.score > 0 for tf in higher):
+        reasons.append("higher timeframes aligned bullish")
+        total += 1.0
+    elif all(tf.score < 0 for tf in higher):
+        reasons.append("higher timeframes aligned bearish")
+        total -= 1.0
+    else:
+        reasons.append("higher timeframes mixed")
+
+    if all(tf.score > 0 for tf in lower):
+        reasons.append("execution timeframes aligned bullish")
+        total += 0.5
+    elif all(tf.score < 0 for tf in lower):
+        reasons.append("execution timeframes aligned bearish")
+        total -= 0.5
+    else:
+        reasons.append("execution timeframes mixed")
+
+    if funding_rate > 0.001:
+        total -= 0.5
+        reasons.append(f"funding elevated at {funding_rate * 100:+.4f}%")
+    elif funding_rate < -0.001:
+        total += 0.5
+        reasons.append(f"funding negative at {funding_rate * 100:+.4f}%")
+    else:
+        reasons.append(f"funding neutral at {funding_rate * 100:+.4f}%")
+
+    if total >= 6:
+        return "LONG", total, reasons
+    if total <= -6:
+        return "SHORT", total, reasons
+    return "NEUTRAL", total, reasons
+
+
+def fmt_vol(v: float) -> str:
+    if v >= 1e9:
+        return f"${v / 1e9:.2f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.0f}K"
+    return f"${v:.0f}"
+
+
+def _request_json(url: str, params: Optional[dict] = None, timeout: int = 10) -> dict:
+    response = requests.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
 
 def binance_ping() -> bool:
     try:
-        r = requests.get(f"{ENDPOINTS['binance']}/ping", timeout=5)
-        return r.status_code == 200
+        return requests.get(f"{ENDPOINTS['binance']}/ping", timeout=5).status_code == 200
     except Exception:
         return False
 
 
-def binance_get_tickers(n: int) -> list:
-    r = requests.get(f"{ENDPOINTS['binance']}/ticker/24hr", timeout=10)
-    r.raise_for_status()
-    tickers = [t for t in r.json() if t["symbol"].endswith("USDT") and float(t["quoteVolume"]) > 0]
-    tickers.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
+def binance_get_tickers() -> List[MarketMeta]:
+    data = _request_json(f"{ENDPOINTS['binance']}/ticker/24hr")
+    items = [x for x in data if x["symbol"].endswith("USDT") and float(x["quoteVolume"]) > 0]
+    items.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     return [
-        {"symbol": t["symbol"], "price": float(t["lastPrice"]),
-         "change_24h": float(t["priceChangePercent"]), "volume_usdt": float(t["quoteVolume"])}
-        for t in tickers[:n]
+        MarketMeta(
+            symbol=x["symbol"],
+            price=float(x["lastPrice"]),
+            change_24h=float(x["priceChangePercent"]),
+            volume_usdt=float(x["quoteVolume"]),
+            venue_id=x["symbol"],
+        )
+        for x in items
     ]
 
 
-def binance_get_klines(symbol: str) -> list:
-    r = requests.get(f"{ENDPOINTS['binance']}/klines",
-                     params={"symbol": symbol, "interval": INTERVAL, "limit": KLINE_LIMIT}, timeout=10)
-    r.raise_for_status()
-    return [float(k[4]) for k in r.json()]   # close prices, oldest→newest
+def binance_get_klines(symbol: str, interval: str, limit: int) -> List[Dict[str, float]]:
+    data = _request_json(
+        f"{ENDPOINTS['binance']}/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+    )
+    return [
+        {
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+        }
+        for k in data
+    ]
 
 
 def binance_get_funding(symbol: str) -> float:
     try:
-        r = requests.get(f"{ENDPOINTS['binance']}/fundingRate",
-                         params={"symbol": symbol, "limit": 1}, timeout=5)
-        data = r.json()
+        data = _request_json(
+            f"{ENDPOINTS['binance']}/fundingRate",
+            params={"symbol": symbol, "limit": 1},
+            timeout=5,
+        )
         return float(data[-1]["fundingRate"]) if data else 0.0
     except Exception:
         return 0.0
 
 
-# ── Adaptador Bybit ──────────────────────────────────────────────────────────
-
 def bybit_ping() -> bool:
     try:
-        r = requests.get(f"{ENDPOINTS['bybit']}/market/time", timeout=5)
-        return r.status_code == 200
+        return requests.get(f"{ENDPOINTS['bybit']}/market/time", timeout=5).status_code == 200
     except Exception:
         return False
 
 
-def bybit_get_tickers(n: int) -> list:
-    r = requests.get(f"{ENDPOINTS['bybit']}/market/tickers",
-                     params={"category": "linear"}, timeout=10)
-    r.raise_for_status()
-    items = r.json().get("result", {}).get("list", [])
-    items = [t for t in items if t["symbol"].endswith("USDT") and float(t.get("turnover24h", 0)) > 0]
-    items.sort(key=lambda t: float(t.get("turnover24h", 0)), reverse=True)
-    result = []
-    for t in items[:n]:
-        price = float(t["lastPrice"])
-        pct = float(t.get("price24hPcnt", 0)) * 100
-        vol = float(t.get("turnover24h", 0))
-        result.append({"symbol": t["symbol"], "price": price, "change_24h": pct, "volume_usdt": vol})
-    return result
+def bybit_get_tickers() -> List[MarketMeta]:
+    data = _request_json(f"{ENDPOINTS['bybit']}/market/tickers", params={"category": "linear"})
+    items = data.get("result", {}).get("list", [])
+    items = [x for x in items if x["symbol"].endswith("USDT") and float(x.get("turnover24h", 0)) > 0]
+    items.sort(key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
+    return [
+        MarketMeta(
+            symbol=x["symbol"],
+            price=float(x["lastPrice"]),
+            change_24h=float(x.get("price24hPcnt", 0)) * 100,
+            volume_usdt=float(x.get("turnover24h", 0)),
+            venue_id=x["symbol"],
+        )
+        for x in items
+    ]
 
 
-def bybit_get_klines(symbol: str) -> list:
-    r = requests.get(f"{ENDPOINTS['bybit']}/market/kline",
-                     params={"category": "linear", "symbol": symbol,
-                             "interval": _to_bybit_interval(INTERVAL), "limit": KLINE_LIMIT}, timeout=10)
-    r.raise_for_status()
-    data = r.json().get("result", {}).get("list", [])
-    # Bybit retorna newest first — inverter para oldest→newest
-    closes = [float(k[4]) for k in reversed(data)]
-    return closes
+def bybit_get_klines(symbol: str, interval: str, limit: int) -> List[Dict[str, float]]:
+    data = _request_json(
+        f"{ENDPOINTS['bybit']}/market/kline",
+        params={
+            "category": "linear",
+            "symbol": symbol,
+            "interval": _to_bybit_interval(interval),
+            "limit": limit,
+        },
+    )
+    rows = list(reversed(data.get("result", {}).get("list", [])))
+    return [
+        {
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+        }
+        for k in rows
+    ]
 
 
 def bybit_get_funding(symbol: str) -> float:
     try:
-        r = requests.get(f"{ENDPOINTS['bybit']}/market/funding/history",
-                         params={"category": "linear", "symbol": symbol, "limit": 1}, timeout=5)
-        data = r.json().get("result", {}).get("list", [])
-        return float(data[0]["fundingRate"]) if data else 0.0
+        data = _request_json(
+            f"{ENDPOINTS['bybit']}/market/funding/history",
+            params={"category": "linear", "symbol": symbol, "limit": 1},
+            timeout=5,
+        )
+        rows = data.get("result", {}).get("list", [])
+        return float(rows[0]["fundingRate"]) if rows else 0.0
     except Exception:
         return 0.0
 
 
-# ── Adaptador OKX ────────────────────────────────────────────────────────────
-
 def okx_ping() -> bool:
     try:
-        r = requests.get(f"{ENDPOINTS['okx']}/public/time", timeout=5)
-        return r.status_code == 200 and r.json().get("code") == "0"
+        response = requests.get(f"{ENDPOINTS['okx']}/public/time", timeout=5)
+        return response.status_code == 200 and response.json().get("code") == "0"
     except Exception:
         return False
 
 
-def okx_get_tickers(n: int) -> list:
-    r = requests.get(f"{ENDPOINTS['okx']}/market/tickers",
-                     params={"instType": "SWAP"}, timeout=10)
-    r.raise_for_status()
-    items = r.json().get("data", [])
-    items = [t for t in items if t["instId"].endswith("-USDT-SWAP") and float(t.get("volCcy24h", 0)) > 0]
-    items.sort(key=lambda t: float(t.get("volCcy24h", 0)), reverse=True)
-    result = []
-    for t in items[:n]:
-        price = float(t["last"])
-        open24h = float(t.get("open24h", price) or price)
-        pct = ((price - open24h) / open24h * 100) if open24h else 0
-        vol = float(t.get("volCcy24h", 0))
-        sym = t["instId"].replace("-USDT-SWAP", "USDT")
-        result.append({"symbol": sym, "price": price, "change_24h": pct, "volume_usdt": vol,
-                        "_okx_id": t["instId"]})
-    return result
+def okx_get_tickers() -> List[MarketMeta]:
+    data = _request_json(f"{ENDPOINTS['okx']}/market/tickers", params={"instType": "SWAP"})
+    items = data.get("data", [])
+    items = [x for x in items if x["instId"].endswith("-USDT-SWAP") and float(x.get("volCcy24h", 0)) > 0]
+    items.sort(key=lambda x: float(x.get("volCcy24h", 0)), reverse=True)
+    metas = []
+    for x in items:
+        price = float(x["last"])
+        open24h = float(x.get("open24h", price) or price)
+        change_24h = ((price - open24h) / open24h * 100) if open24h else 0.0
+        metas.append(
+            MarketMeta(
+                symbol=x["instId"].replace("-USDT-SWAP", "USDT"),
+                price=price,
+                change_24h=change_24h,
+                volume_usdt=float(x.get("volCcy24h", 0)),
+                venue_id=x["instId"],
+            )
+        )
+    return metas
 
 
-def okx_get_klines(inst_id: str) -> list:
-    r = requests.get(f"{ENDPOINTS['okx']}/market/candles",
-                     params={"instId": inst_id, "bar": _to_okx_interval(INTERVAL), "limit": KLINE_LIMIT},
-                     timeout=10)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    closes = [float(k[4]) for k in reversed(data)]   # newest first → reverse
-    return closes
+def okx_get_klines(inst_id: str, interval: str, limit: int) -> List[Dict[str, float]]:
+    data = _request_json(
+        f"{ENDPOINTS['okx']}/market/candles",
+        params={"instId": inst_id, "bar": _to_okx_interval(interval), "limit": limit},
+    )
+    rows = list(reversed(data.get("data", [])))
+    return [
+        {
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+        }
+        for k in rows
+    ]
 
 
 def okx_get_funding(inst_id: str) -> float:
     try:
-        r = requests.get(f"{ENDPOINTS['okx']}/public/funding-rate",
-                         params={"instId": inst_id}, timeout=5)
-        data = r.json().get("data", [])
-        return float(data[0]["fundingRate"]) if data else 0.0
+        data = _request_json(f"{ENDPOINTS['okx']}/public/funding-rate", params={"instId": inst_id}, timeout=5)
+        rows = data.get("data", [])
+        return float(rows[0]["fundingRate"]) if rows else 0.0
     except Exception:
         return 0.0
 
 
-# ── Detecção automática de exchange ─────────────────────────────────────────
-
 EXCHANGE_ADAPTERS = {
     "binance": (binance_ping, binance_get_tickers, binance_get_klines, binance_get_funding),
-    "bybit":   (bybit_ping,   bybit_get_tickers,   bybit_get_klines,   bybit_get_funding),
-    "okx":     (okx_ping,     okx_get_tickers,     okx_get_klines,     okx_get_funding),
+    "bybit": (bybit_ping, bybit_get_tickers, bybit_get_klines, bybit_get_funding),
+    "okx": (okx_ping, okx_get_tickers, okx_get_klines, okx_get_funding),
 }
 
 
 def detect_exchange() -> str:
     for name in ("binance", "bybit", "okx"):
         ping_fn = EXCHANGE_ADAPTERS[name][0]
-        print(f"  Testando {name}...", end=" ", flush=True)
+        print(f"  Testing {name}...", end=" ", flush=True)
         if ping_fn():
             print("OK")
             return name
-        print("bloqueado")
-    raise RuntimeError("Nenhuma exchange acessível. Use --demo para modo demonstração.")
+        print("blocked")
+    raise RuntimeError("No exchange endpoint reachable. Try --exchange bybit, --exchange okx, or --demo.")
 
 
-# ── Dados de demonstração ────────────────────────────────────────────────────
-
-def _gen_closes(start: float, drift: float, vol: float, n: int) -> list:
-    random.seed(hash(str(start)) & 0xFFFF)
+def _gen_demo_candles(start: float, drift: float, vol: float, count: int) -> List[Dict[str, float]]:
+    random.seed(hash((start, drift, vol, count)) & 0xFFFF)
     closes = [start]
-    for _ in range(n - 1):
-        closes.append(max(closes[-1] * (1 + drift + random.gauss(0, vol)), 0.001))
-    return closes
+    for _ in range(count - 1):
+        closes.append(max(closes[-1] * (1 + drift + random.gauss(0, vol)), 0.0001))
+    candles = []
+    prev = closes[0]
+    for close in closes:
+        high = max(prev, close) * (1 + abs(random.gauss(0, vol / 2)))
+        low = min(prev, close) * max(0.0001, (1 - abs(random.gauss(0, vol / 2))))
+        candles.append({"open": prev, "high": high, "low": low, "close": close})
+        prev = close
+    return candles
 
 
-DEMO_PAIRS = [
-    ("BTCUSDT",   67500, +2.3, 32.4e9, +0.003, 0.008, +0.00012),
-    ("ETHUSDT",    3520, +1.8, 18.7e9, +0.002, 0.010, +0.00008),
-    ("SOLUSDT",     175, +5.1,  8.2e9, +0.005, 0.015, +0.00020),
-    ("BNBUSDT",     580, -0.4,  4.1e9, -0.001, 0.009, -0.00005),
-    ("XRPUSDT",    0.52, -3.2,  6.3e9, -0.004, 0.012, -0.00018),
-    ("DOGEUSDT",   0.15, -5.7,  5.8e9, -0.006, 0.018, -0.00025),
-    ("ADAUSDT",    0.48, +0.9,  3.2e9, +0.001, 0.011, +0.00003),
-    ("AVAXUSDT",   38.5, -2.1,  2.9e9, -0.002, 0.013, -0.00010),
-    ("DOTUSDT",     7.8, -4.3,  2.1e9, -0.005, 0.014, -0.00022),
-    ("LINKUSDT",   15.2, +3.6,  1.8e9, +0.004, 0.012, +0.00015),
-    ("LTCUSDT",    82.0, +1.1,  1.5e9, +0.001, 0.009, +0.00004),
-    ("MATICUSDT",  0.72, -6.2,  1.3e9, -0.007, 0.020, -0.00030),
-    ("NEARUSDT",    5.4, +4.8,  1.1e9, +0.005, 0.016, +0.00018),
-    ("ARBUSDT",    1.12, -1.8,  0.9e9, -0.002, 0.015, -0.00008),
-    ("OPUSDT",     2.45, +2.7,  0.8e9, +0.003, 0.014, +0.00011),
-]
-
-
-# ── Scoring ──────────────────────────────────────────────────────────────────
-
-def score_signal(sig: Signal) -> Signal:
-    score = 0.0
-    reasons = []
-
-    if sig.rsi is not None and not math.isnan(sig.rsi):
-        if sig.rsi < RSI_OVERSOLD:
-            score += 2;  reasons.append(f"RSI {sig.rsi:.1f} → sobrevendido (LONG)")
-        elif sig.rsi > RSI_OVERBOUGHT:
-            score -= 2;  reasons.append(f"RSI {sig.rsi:.1f} → sobrecomprado (SHORT)")
-        else:
-            reasons.append(f"RSI {sig.rsi:.1f} → zona neutra")
-
-    if sig.ema_fast and sig.ema_slow:
-        if sig.ema_fast > sig.ema_slow:
-            score += 1.5;  reasons.append(f"EMA{EMA_FAST} > EMA{EMA_SLOW} → tendência de alta (LONG)")
-        else:
-            score -= 1.5;  reasons.append(f"EMA{EMA_FAST} < EMA{EMA_SLOW} → tendência de baixa (SHORT)")
-
-    if sig.macd is not None and sig.macd_signal is not None \
-       and not math.isnan(sig.macd) and not math.isnan(sig.macd_signal):
-        if sig.macd > sig.macd_signal:
-            score += 1;  reasons.append("MACD acima do sinal → momentum positivo (LONG)")
-        else:
-            score -= 1;  reasons.append("MACD abaixo do sinal → momentum negativo (SHORT)")
-
-    if sig.funding_rate is not None:
-        fr = sig.funding_rate * 100
-        if sig.funding_rate > 0.001:
-            score -= 1;  reasons.append(f"Funding {fr:+.4f}% → longs pagando caro (SHORT)")
-        elif sig.funding_rate < -0.001:
-            score += 1;  reasons.append(f"Funding {fr:+.4f}% → shorts pagando caro (LONG)")
-        else:
-            reasons.append(f"Funding {fr:+.4f}% → neutro")
-
-    if sig.change_24h > 3:
-        score += 0.5;  reasons.append(f"Variação 24h {sig.change_24h:+.1f}% → momentum positivo")
-    elif sig.change_24h < -3:
-        score -= 0.5;  reasons.append(f"Variação 24h {sig.change_24h:+.1f}% → momentum negativo")
-
-    sig.score = score
-    sig.reasons = reasons
-    sig.direction = "LONG" if score >= 2 else ("SHORT" if score <= -2 else "NEUTRO")
-    return sig
-
-
-# ── Relatório ────────────────────────────────────────────────────────────────
-
-def fmt_vol(v: float) -> str:
-    if v >= 1e9: return f"${v/1e9:.2f}B"
-    if v >= 1e6: return f"${v/1e6:.1f}M"
-    return f"${v/1e3:.0f}K"
-
-
-def print_report(signals: list, exchange: str = "", demo: bool = False) -> None:
-    longs  = sorted([s for s in signals if s.direction == "LONG"],  key=lambda s: s.score, reverse=True)
-    shorts = sorted([s for s in signals if s.direction == "SHORT"], key=lambda s: s.score)
-    neutro = [s for s in signals if s.direction == "NEUTRO"]
-
-    W   = 74
-    src = f" [{exchange.upper()}]" if exchange else ""
-    tag = " [MODO DEMONSTRAÇÃO]" if demo else src
-
-    print(f"\n{'═'*W}")
-    print(f"  FUTURES SIGNAL SCANNER{tag}")
-    print(f"  Timeframe: {INTERVAL} | Pares: {len(signals)} | RSI-14 / EMA{EMA_FAST}/EMA{EMA_SLOW} / MACD / Funding")
-    print(f"{'═'*W}\n")
-
-    for title, items, show_detail in [
-        ("🟢  LONG  — Candidatos a Compra", longs, True),
-        ("🔴  SHORT — Candidatos a Venda",  shorts, True),
-        ("⚪  NEUTRO — Sem Sinal Claro",    neutro, False),
-    ]:
-        print(f"{'─'*W}")
-        print(f"  {title}  ({len(items)} par(es))")
-        print(f"{'─'*W}")
-        if not items:
-            print("  —\n"); continue
-        for s in items:
-            print(
-                f"  {s.symbol:<14}  Preço: {s.price:>12,.4f}  "
-                f"24h: {s.change_24h:>+6.2f}%  Vol: {fmt_vol(s.volume_usdt):<9}  Score: {s.score:>+5.1f}"
-            )
-            if show_detail:
-                for r in s.reasons:
-                    print(f"     • {r}")
-            print()
-
-    print(f"{'═'*W}")
-    print("  ⚠  Análise técnica não garante resultados. Use stop-loss.")
-    print(f"{'═'*W}\n")
-
-
-# ── Pipelines ────────────────────────────────────────────────────────────────
-
-def build_signals(exchange: str) -> list:
-    _, get_tickers, get_klines, get_funding = EXCHANGE_ADAPTERS[exchange]
-
-    print(f"Buscando top {TOP_N} pares USDT ({exchange})...")
-    tickers = get_tickers(TOP_N)
-
+def run_demo(top_n: int) -> None:
+    demo = [
+        ("BTCUSDT", 67500, 32.4e9, 0.00012, {"4h": (0.0025, 0.007), "1h": (0.0020, 0.006), "15m": (0.0015, 0.005), "1m": (0.0006, 0.003)}),
+        ("ETHUSDT", 3520, 18.7e9, 0.00008, {"4h": (0.0018, 0.008), "1h": (0.0012, 0.006), "15m": (0.0008, 0.004), "1m": (0.0003, 0.002)}),
+        ("SOLUSDT", 175, 8.2e9, 0.00020, {"4h": (0.0030, 0.012), "1h": (0.0022, 0.010), "15m": (0.0015, 0.008), "1m": (0.0005, 0.004)}),
+        ("XRPUSDT", 0.52, 6.3e9, -0.00018, {"4h": (-0.0016, 0.010), "1h": (-0.0010, 0.008), "15m": (-0.0008, 0.006), "1m": (-0.0002, 0.003)}),
+    ]
+    if top_n > 0:
+        demo = demo[:top_n]
     signals = []
-    for i, t in enumerate(tickers, 1):
-        sym = t["symbol"]
-        okx_id = t.get("_okx_id", sym)   # OKX usa instId diferente
-        print(f"  [{i:>2}/{len(tickers)}] {sym}...", end="\r", flush=True)
-        try:
-            closes = get_klines(okx_id if exchange == "okx" else sym)
-            if not closes:
-                continue
-            macd_v, macd_sig = calc_macd(closes)
-            fr = get_funding(okx_id if exchange == "okx" else sym)
-            time.sleep(0.08)
-
-            sig = Signal(
-                symbol       = sym,
-                price        = t["price"],
-                change_24h   = t["change_24h"],
-                volume_usdt  = t["volume_usdt"],
-                rsi          = calc_rsi(closes),
-                ema_fast     = _ema(closes, EMA_FAST)[-1],
-                ema_slow     = _ema(closes, EMA_SLOW)[-1],
-                macd         = macd_v,
-                macd_signal  = macd_sig,
-                funding_rate = fr,
+    for symbol, price, volume_usdt, funding_rate, tf_config in demo:
+        timeframe_signals = {}
+        for timeframe in TIMEFRAMES:
+            drift, vol = tf_config[timeframe]
+            timeframe_signals[timeframe] = _analyze_timeframe(timeframe, _gen_demo_candles(price, drift, vol, KLINE_LIMIT))
+        direction, score, reasons = _composite_bias(timeframe_signals, funding_rate)
+        signals.append(
+            CoinSignal(
+                symbol=symbol,
+                price=timeframe_signals["1m"].price,
+                change_24h=0.0,
+                volume_usdt=volume_usdt,
+                funding_rate=funding_rate,
+                direction=direction,
+                score=score,
+                bias="demo",
+                timeframe_signals=timeframe_signals,
+                reasons=reasons,
             )
-            signals.append(score_signal(sig))
-        except Exception as e:
-            print(f"\n  Erro em {sym}: {e}")
+        )
+    print_report(signals, exchange="demo")
 
-    print(" " * 55, end="\r")
+
+def build_signals(exchange: str, top_n: int, symbols: Optional[List[str]]) -> List[CoinSignal]:
+    _, get_tickers, get_klines, get_funding = EXCHANGE_ADAPTERS[exchange]
+    markets = get_tickers()
+
+    symbol_set = {s.upper() for s in symbols} if symbols else None
+    if symbol_set:
+        markets = [m for m in markets if m.symbol.upper() in symbol_set]
+    if top_n > 0:
+        markets = markets[:top_n]
+
+    print(f"Scanning {len(markets)} USDT perpetual pairs on {exchange}...")
+
+    signals: List[CoinSignal] = []
+    for idx, market in enumerate(markets, 1):
+        print(f"  [{idx:>4}/{len(markets)}] {market.symbol}...", end="\r", flush=True)
+        try:
+            timeframe_signals = {}
+            for timeframe in TIMEFRAMES:
+                candles = get_klines(market.venue_id, timeframe, KLINE_LIMIT)
+                if len(candles) < max(SMA_LENGTH, EMA_LENGTH) + 5:
+                    raise RuntimeError(f"not enough candles for {timeframe}")
+                timeframe_signals[timeframe] = _analyze_timeframe(timeframe, candles)
+                time.sleep(0.03)
+
+            funding_rate = get_funding(market.venue_id)
+            direction, score, reasons = _composite_bias(timeframe_signals, funding_rate)
+            signals.append(
+                CoinSignal(
+                    symbol=market.symbol,
+                    price=timeframe_signals["1m"].price,
+                    change_24h=market.change_24h,
+                    volume_usdt=market.volume_usdt,
+                    funding_rate=funding_rate,
+                    direction=direction,
+                    score=score,
+                    bias=timeframe_signals["4h"].structure,
+                    timeframe_signals=timeframe_signals,
+                    reasons=reasons,
+                )
+            )
+        except Exception as exc:
+            print(f"\n  Error on {market.symbol}: {exc}")
+    print(" " * 80, end="\r")
     return signals
 
 
-def run_live(forced_exchange: str = "auto") -> None:
+def print_report(signals: List[CoinSignal], exchange: str) -> None:
+    longs = sorted([s for s in signals if s.direction == "LONG"], key=lambda s: s.score, reverse=True)
+    shorts = sorted([s for s in signals if s.direction == "SHORT"], key=lambda s: s.score)
+    neutral = sorted([s for s in signals if s.direction == "NEUTRAL"], key=lambda s: abs(s.score), reverse=True)
+
+    width = 110
+    print("\n" + "=" * width)
+    print(f"MULTI-TIMEFRAME FUTURES STRUCTURE SCANNER [{exchange.upper()}]")
+    print(f"Pairs: {len(signals)} | Timeframes: {', '.join(TIMEFRAMES)} | EMA {EMA_LENGTH} | SMA {SMA_LENGTH} | SMC-lite")
+    print("=" * width + "\n")
+
+    sections = [
+        ("LONG", longs),
+        ("SHORT", shorts),
+        ("NEUTRAL", neutral),
+    ]
+    for title, items in sections:
+        print("-" * width)
+        print(f"{title} ({len(items)})")
+        print("-" * width)
+        if not items:
+            print("none\n")
+            continue
+        for item in items:
+            print(
+                f"{item.symbol:<14} price={item.price:>12,.6f} 24h={item.change_24h:>+6.2f}% "
+                f"vol={fmt_vol(item.volume_usdt):<9} funding={item.funding_rate * 100:+.4f}% score={item.score:+6.2f}"
+            )
+            print("  composite: " + "; ".join(item.reasons))
+            for timeframe in TIMEFRAMES:
+                tf = item.timeframe_signals[timeframe]
+                print(
+                    f"  {timeframe:<3} {tf.structure:<18} | {tf.ma_stack:<7} | {tf.price_vs_ma:<12} | "
+                    f"EMA slope {tf.ema_slope:<4} | {tf.pd_location:<8} | liquidity: {tf.liquidity}"
+                )
+            print()
+
+    print("=" * width)
+    print("Use this as a directional map, not a standalone trading system.")
+    print("=" * width + "\n")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Multi-timeframe scanner for USDT perpetuals")
+    parser.add_argument("--exchange", default="auto", choices=["auto", "binance", "bybit", "okx"], help="Exchange to scan")
+    parser.add_argument("--demo", action="store_true", help="Run with generated demo data")
+    parser.add_argument("--top", type=int, default=TOP_N, help="Limit pair count. 0 means all pairs")
+    parser.add_argument("--symbols", default="", help="Comma-separated symbols to scan, for example BTCUSDT,SOLUSDT")
+    return parser.parse_args()
+
+
+def run_live(forced_exchange: str, top_n: int, symbols: Optional[List[str]]) -> None:
     if not _HAS_REQUESTS:
-        raise RuntimeError("Instale 'requests': pip install requests")
+        raise RuntimeError("Install requests: pip install requests")
     exchange = forced_exchange if forced_exchange != "auto" else detect_exchange()
-    signals  = build_signals(exchange)
-    print_report(signals, exchange=exchange)
+    signals = build_signals(exchange, top_n, symbols)
+    print_report(signals, exchange)
 
 
-def run_demo() -> None:
-    print("Gerando análise com dados de demonstração...")
-    signals = []
-    for sym, price, chg, vol, drift, vol_p, fr in DEMO_PAIRS:
-        closes   = _gen_closes(price, drift, vol_p, KLINE_LIMIT)
-        macd_v, macd_sig = calc_macd(closes)
-        sig = Signal(
-            symbol=sym, price=price, change_24h=chg, volume_usdt=vol,
-            rsi=calc_rsi(closes),
-            ema_fast=_ema(closes, EMA_FAST)[-1],
-            ema_slow=_ema(closes, EMA_SLOW)[-1],
-            macd=macd_v, macd_signal=macd_sig,
-            funding_rate=fr,
-        )
-        signals.append(score_signal(sig))
-    print_report(signals, demo=True)
-
-
-# ── Entry point ──────────────────────────────────────────────────────────────
-
-def main():
-    import binance_futures_signals as _m
-
-    parser = argparse.ArgumentParser(description="Scanner de sinais para futuros perpétuos USDT")
-    parser.add_argument("--exchange", default="auto",   choices=["auto","binance","bybit","okx"], help="Exchange a usar")
-    parser.add_argument("--demo",     action="store_true", help="Usar dados de demonstração")
-    parser.add_argument("--top",      type=int, default=TOP_N,    help=f"Número de pares (padrão: {TOP_N})")
-    parser.add_argument("--interval", default=INTERVAL,           help="Timeframe: 15m 1h 4h 1d (padrão: 1h)")
-    args = parser.parse_args()
-
-    _m.TOP_N    = args.top
-    _m.INTERVAL = args.interval
+def main() -> None:
+    args = parse_args()
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] or None
 
     if args.demo:
-        run_demo()
-    else:
-        try:
-            run_live(args.exchange)
-        except Exception as e:
-            print(f"\n[ERRO] {e}")
-            print("Dica: tente --exchange bybit, --exchange okx, ou --demo\n")
-            sys.exit(1)
+        run_demo(args.top)
+        return
+
+    try:
+        run_live(args.exchange, args.top, symbols)
+    except Exception as exc:
+        print(f"\n[ERROR] {exc}")
+        print("Tip: try --exchange bybit, --exchange okx, or --demo\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
